@@ -13,11 +13,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStream;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
+import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -25,6 +24,7 @@ import java.util.zip.ZipOutputStream;
 public class AlbumDownloadService {
 
     private static final Logger log = LoggerFactory.getLogger(AlbumDownloadService.class);
+    private static final int BUFFER_SIZE = 64 * 1024; // 64KB buffer
 
     private final AlbumRepository albumRepository;
 
@@ -44,7 +44,15 @@ public class AlbumDownloadService {
         String zipFilename = artistName + " - " + album.getTitle() + ".zip";
 
         StreamingResponseBody responseBody = outputStream -> {
-            try (ZipOutputStream zipOut = new ZipOutputStream(outputStream)) {
+            try (BufferedOutputStream bufferedOut = new BufferedOutputStream(outputStream, BUFFER_SIZE);
+                 ZipOutputStream zipOut = new ZipOutputStream(bufferedOut)) {
+
+                // Audio files are already compressed (MP3, M4A, FLAC, OPUS, etc.).
+                // Setting NO_COMPRESSION drastically speeds up streaming and avoids CPU/timeout bottlenecks.
+                zipOut.setLevel(Deflater.NO_COMPRESSION);
+
+                byte[] buffer = new byte[BUFFER_SIZE];
+
                 // Add tracks
                 if (album.getTracks() != null) {
                     for (Track track : album.getTracks()) {
@@ -53,7 +61,10 @@ public class AlbumDownloadService {
                             ZipEntry zipEntry = new ZipEntry(file.getName());
                             zipOut.putNextEntry(zipEntry);
                             try (InputStream in = new FileInputStream(file)) {
-                                in.transferTo(zipOut);
+                                int bytesRead;
+                                while ((bytesRead = in.read(buffer)) != -1) {
+                                    zipOut.write(buffer, 0, bytesRead);
+                                }
                             }
                             zipOut.closeEntry();
                         } else {
@@ -69,15 +80,26 @@ public class AlbumDownloadService {
                         ZipEntry coverEntry = new ZipEntry(coverFile.getName());
                         zipOut.putNextEntry(coverEntry);
                         try (InputStream in = new FileInputStream(coverFile)) {
-                            in.transferTo(zipOut);
+                            int bytesRead;
+                            while ((bytesRead = in.read(buffer)) != -1) {
+                                zipOut.write(buffer, 0, bytesRead);
+                            }
                         }
                         zipOut.closeEntry();
                     }
                 }
 
                 zipOut.finish();
+                bufferedOut.flush();
+            } catch (IOException e) {
+                if (isClientAbortException(e)) {
+                    log.info("Client cancelled download for albumId: {} ({})", albumId, e.getMessage());
+                } else {
+                    log.error("IO error streaming album zip for albumId: {}", albumId, e);
+                    throw e;
+                }
             } catch (Exception e) {
-                log.error("Error streaming album zip for albumId: {}", albumId, e);
+                log.error("Unexpected error streaming album zip for albumId: {}", albumId, e);
                 throw e;
             }
         };
@@ -90,5 +112,18 @@ public class AlbumDownloadService {
                 .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition.toString())
                 .contentType(MediaType.parseMediaType("application/zip"))
                 .body(responseBody);
+    }
+
+    private boolean isClientAbortException(Throwable t) {
+        while (t != null) {
+            String className = t.getClass().getName();
+            String msg = t.getMessage();
+            if (className.contains("ClientAbortException") ||
+                (msg != null && (msg.contains("Broken pipe") || msg.contains("Connection reset by peer")))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 }
